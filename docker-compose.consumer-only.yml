@@ -1,0 +1,38 @@
+ersion: '3.8'
+
+services:
+  influxdb-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile.influxdb
+    container_name: citi-bike-influxdb-consumer
+    environment:
+      # Kafka Configuration
+      KAFKA_BROKER: "kafka:29092"
+      KAFKA_TOPIC: "citi_bike_stations"
+      CONSUMER_GROUP: "influxdb_consumer_group"
+      # InfluxDB Configuration - Connect to centralized InfluxDB
+      INFLUXDB_URL: "http://influxdb:8086"
+      INFLUXDB_TOKEN: "data-infra-super-secret-auth-token-2025"
+      INFLUXDB_ORG: "data-infra-org"
+      INFLUXDB_BUCKET: "citi-bike-data"
+      # Performance Configuration
+      BATCH_SIZE: "50"
+      BATCH_TIMEOUT: "5"
+    networks:
+      - data-infra-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f python || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  data-infra-network:
+    external: true
