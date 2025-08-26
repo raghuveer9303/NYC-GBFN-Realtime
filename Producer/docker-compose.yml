@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  citi-bike-producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: citi-bike-producer
+    environment:
+      # Use the internal Kafka service name and port from your kafka-docker.yaml
+      KAFKA_BROKER: "kafka:29092"
+      # Optional: Customize the fetch interval (in seconds)
+      FETCH_INTERVAL: "30"
+    networks:
+      - data-infra-network
+    restart: unless-stopped
+    depends_on:
+      - kafka-check
+    # Add health check to monitor the producer
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f python || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    # Optional: Add logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Health check service to ensure Kafka is ready
+  kafka-check:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka-check
+    networks:
+      - data-infra-network
+    command: >
+      bash -c "
+        echo 'Waiting for Kafka to be ready...'
+        while ! kafka-broker-api-versions --bootstrap-server kafka:29092 >/dev/null 2>&1; do
+          echo 'Kafka not ready, waiting 5 seconds...'
+          sleep 5
+        done
+        echo 'Kafka is ready!'
+      "
+    restart: "no"
+
+networks:
+  data-infra-network:
+    external: true

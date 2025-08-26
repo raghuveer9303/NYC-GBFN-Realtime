@@ -1,51 +1,71 @@
 version: '3.8'
 
 services:
-  citi-bike-producer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: citi-bike-producer
-    environment:
-      # Use the internal Kafka service name and port from your kafka-docker.yaml
-      KAFKA_BROKER: "kafka:29092"
-      # Optional: Customize the fetch interval (in seconds)
-      FETCH_INTERVAL: "30"
-    networks:
-      - data-infra-network
-    restart: unless-stopped
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: nyc-gbfn-nginx
+    ports:
+      - "9518:80"  # External port 9518 maps to nginx port 80
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - kafka-check
-    # Add health check to monitor the producer
+      - frontend
+      - backend
+    networks:
+      - nyc-gbfn-network
+    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f python || exit 1"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-    # Optional: Add logging configuration
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
-  # Health check service to ensure Kafka is ready
-  kafka-check:
-    image: confluentinc/cp-kafka:7.4.0
-    container_name: kafka-check
+  # Frontend Service (React/Vite)
+  frontend:
+    build:
+      context: ./Frontend
+      dockerfile: Dockerfile
+    container_name: nyc-gbfn-frontend
+    environment:
+      - VITE_API_BASE_URL=/api
+      - NODE_ENV=production
+    volumes:
+      - ./Frontend:/app
+      - /app/node_modules
     networks:
-      - data-infra-network
-    command: >
-      bash -c "
-        echo 'Waiting for Kafka to be ready...'
-        while ! kafka-broker-api-versions --bootstrap-server kafka:29092 >/dev/null 2>&1; do
-          echo 'Kafka not ready, waiting 5 seconds...'
-          sleep 5
-        done
-        echo 'Kafka is ready!'
-      "
-    restart: "no"
+      - nyc-gbfn-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Backend Service (FastAPI)
+  backend:
+    build:
+      context: ./Backend
+      dockerfile: Dockerfile
+    container_name: nyc-gbfn-backend
+    environment:
+      - INFLUXDB_URL=${INFLUXDB_URL:-http://brahma:8086}
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN:-data-infra-super-secret-auth-token-2025}
+      - INFLUXDB_ORG=${INFLUXDB_ORG:-data-infra-org}
+      - INFLUXDB_BUCKET=${INFLUXDB_BUCKET:-citi-bike-data}
+      - LOOKBACK_MINUTES=${LOOKBACK_MINUTES:-15}
+    networks:
+      - nyc-gbfn-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 networks:
-  data-infra-network:
-    external: true
+  nyc-gbfn-network:
+    driver: bridge
+
+volumes:
+  frontend_node_modules:

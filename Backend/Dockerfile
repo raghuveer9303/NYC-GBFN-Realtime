@@ -15,22 +15,25 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first to leverage Docker cache
-COPY requirements.influxdb.txt ./requirements.txt
+COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the consumer script
-COPY influxdb_consumer.py .
+# Copy the API script
+COPY anomaly_api.py .
 
 # Create a non-root user for security
-RUN useradd --create-home --shell /bin/bash consumer && \
-    chown -R consumer:consumer /app
-USER consumer
+RUN useradd --create-home --shell /bin/bash apiuser && \
+    chown -R apiuser:apiuser /app
+USER apiuser
+
+# Expose the port that the API runs on
+EXPOSE 8000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD pgrep -f python || exit 1
+    CMD curl -f http://localhost:8000/health || exit 1
 
-# Default command to run the consumer
-CMD ["python", "influxdb_consumer.py"]
+# Default command to run the API
+CMD ["python", "-m", "uvicorn", "anomaly_api:app", "--host", "0.0.0.0", "--port", "8000"]
