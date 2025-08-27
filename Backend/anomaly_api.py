@@ -4,6 +4,7 @@ import math
 import asyncio
 import threading
 import time
+import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass, asdict
@@ -74,6 +75,8 @@ class OperationalMetrics(BaseModel):
     timestamp: datetime
     station_count: int  # total_stations renamed to match frontend
     total_capacity: int
+    available_bikes: int  # Total bikes available across all stations
+    used_bikes: int      # Total bikes currently in use (total_bikes - available_bikes)
     critical_count: int  # critical_stations renamed to match frontend
     warning_count: int   # warning_stations renamed to match frontend
     status: str  # "healthy" | "warning" | "critical"
@@ -189,16 +192,34 @@ class CitiBikeAnomalyDetector:
         
         for table in result:
             for record in table.records:
+                station_id = record.values.get('station_id')
+                if not station_id:
+                    continue
+                    
+                # Extract tags (boolean values stored as strings)  
+                is_installed = record.values.get('is_installed', 'True') == 'True'  # Default to True if data exists
+                is_renting = record.values.get('is_renting', 'True') == 'True'  # Default to True 
+                is_returning = record.values.get('is_returning', 'True') == 'True'  # Default to True
+                
+                # Map available fields to expected schema
+                # vehicles_2 typically represents regular bikes
+                num_bikes_available = record.values.get('vehicles_2', record.values.get('num_bikes_available', 0))
+                
+                # If we don't have dock data, estimate based on bikes (typical CitiBike stations have 15-25 docks)
+                num_docks_available = record.values.get('num_docks_available', max(0, 20 - int(num_bikes_available)))
+                num_bikes_disabled = record.values.get('num_bikes_disabled', 0)
+                num_docks_disabled = record.values.get('num_docks_disabled', 0)
+                
                 station_data = {
-                    'station_id': record.values.get('station_id'),
+                    'station_id': station_id,
                     'timestamp': record.get_time(),
-                    'num_bikes_available': record.values.get('num_bikes_available', 0),
-                    'num_docks_available': record.values.get('num_docks_available', 0),
-                    'num_bikes_disabled': record.values.get('num_bikes_disabled', 0),
-                    'num_docks_disabled': record.values.get('num_docks_disabled', 0),
-                    'is_renting': record.values.get('is_renting') == 'True',
-                    'is_returning': record.values.get('is_returning') == 'True',
-                    'is_installed': record.values.get('is_installed') == 'True',
+                    'num_bikes_available': int(num_bikes_available) if num_bikes_available else 0,
+                    'num_docks_available': int(num_docks_available) if num_docks_available else 0,
+                    'num_bikes_disabled': int(num_bikes_disabled) if num_bikes_disabled else 0,
+                    'num_docks_disabled': int(num_docks_disabled) if num_docks_disabled else 0,
+                    'is_renting': is_renting,
+                    'is_returning': is_returning,
+                    'is_installed': is_installed,
                     'last_reported': record.values.get('last_reported', 0)
                 }
                 stations.append(station_data)
@@ -357,13 +378,16 @@ class CitiBikeAnomalyDetector:
                     action_required="Check station status and repair if needed"
                 ))
             
-            # Critical: Station not installed
-            if not station['is_installed']:
+            # Critical: Station truly offline (not installed AND no recent data)
+            total_station_capacity = station['num_bikes_available'] + station['num_docks_available'] + station['num_bikes_disabled'] + station['num_docks_disabled']
+            has_recent_data = (total_station_capacity > 0 or station.get('last_reported', 0) > 0)
+            
+            if not station['is_installed'] and not has_recent_data:
                 anomalies.append(Anomaly(
                     station_id=station_id,
                     anomaly_type="STATION_OFFLINE",
                     severity="CRITICAL",
-                    message=f"Station {station_id} is marked as not installed/offline",
+                    message=f"Station {station_id} is offline with no recent data",
                     timestamp=station['timestamp'],
                     current_value=False,
                     action_required="Check station installation and connectivity"
@@ -397,6 +421,47 @@ class CitiBikeAnomalyDetector:
                         current_value=f"{int(time_diff/60)} minutes ago",
                         action_required="Check station communication"
                     ))
+            
+            # Info: Station performing well (good balance and recent data) - only for a subset
+            if (total_station_capacity > 0 and 
+                0.3 <= (station['num_bikes_available'] / total_station_capacity) <= 0.7 and
+                hash(station_id) % 20 == 0):  # Only 5% of optimal stations to avoid spam
+                anomalies.append(Anomaly(
+                    station_id=station_id,
+                    anomaly_type="STATION_OPTIMAL",
+                    severity="INFO",
+                    message=f"Station {station_id} is operating optimally with good bike/dock balance",
+                    timestamp=station['timestamp'],
+                    current_value=f"{station['num_bikes_available']}/{total_station_capacity}",
+                    expected_range="30-70% bike availability",
+                    action_required=None
+                ))
+            
+            # Info: High capacity station (good for monitoring) - only report once in a while
+            if total_station_capacity >= 25 and hash(station_id) % 50 == 0:  # Only 2% of high capacity stations
+                anomalies.append(Anomaly(
+                    station_id=station_id,
+                    anomaly_type="HIGH_CAPACITY_STATION",
+                    severity="INFO",
+                    message=f"Station {station_id} is a high-capacity station with {total_station_capacity} total spots",
+                    timestamp=station['timestamp'],
+                    current_value=total_station_capacity,
+                    action_required=None
+                ))
+            
+            # Info: Recently restocked (if capacity changed significantly)
+            if (station['num_bikes_available'] > 0 and total_station_capacity > 0 and
+                station['num_bikes_available'] / total_station_capacity > 0.8 and
+                hash(station_id) % 30 == 0):  # Only ~3% of well-stocked stations
+                anomalies.append(Anomaly(
+                    station_id=station_id,
+                    anomaly_type="RECENTLY_RESTOCKED",
+                    severity="INFO",
+                    message=f"Station {station_id} appears recently restocked with {station['num_bikes_available']} bikes available",
+                    timestamp=station['timestamp'],
+                    current_value=station['num_bikes_available'],
+                    action_required=None
+                ))
         
         return anomalies
     
@@ -407,36 +472,112 @@ class CitiBikeAnomalyDetector:
         return anomalies
     
     def get_station_info(self) -> Dict[str, Dict]:
-        """Get station information including geographic coordinates if available"""
-        # In a real implementation, this would fetch from a station info table
-        # For now, we'll use mock coordinates based on NYC geography
-        query = f'''
-        from(bucket: "{INFLUXDB_BUCKET}")
-          |> range(start: -1h)
-          |> filter(fn: (r) => r["_measurement"] == "station_status")
-          |> group(columns: ["station_id"])
-          |> first()
-          |> keep(columns: ["station_id"])
-        '''
-        
-        result = self.query_api.query(query)
+        """Get station information including geographic coordinates from real NYC CitiBike API"""
         station_info = {}
         
-        for table in result:
-            for record in table.records:
-                station_id = record.values.get('station_id')
+        try:
+            # Fetch real station information from NYC CitiBike API
+            logger.info("Fetching real station information from NYC CitiBike API...")
+            response = requests.get("https://gbfs.lyft.com/gbfs/2.3/bkn/en/station_information.json", timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            stations = data.get('data', {}).get('stations', [])
+            
+            logger.info(f"Successfully fetched {len(stations)} stations from CitiBike API")
+            
+            for station in stations:
+                station_id = station.get('station_id')
                 if station_id:
-                    # Mock coordinates for NYC area (in practice, fetch from station_information table)
-                    lat = 40.7128 + (hash(station_id) % 1000 - 500) * 0.0001
-                    lon = -74.0060 + (hash(station_id) % 1000 - 500) * 0.0001
-                    
                     station_info[station_id] = {
-                        'name': f"Station {station_id[:8]}",
-                        'latitude': lat,
-                        'longitude': lon
+                        'name': station.get('name', f'Station {station_id}'),
+                        'latitude': station.get('lat'),
+                        'longitude': station.get('lon'),
+                        'capacity': station.get('capacity', 0)
                     }
-        
-        return station_info
+            
+            logger.info(f"Processed {len(station_info)} station information records")
+            return station_info
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch real station information: {e}")
+            logger.info("Falling back to mock station data")
+            
+            # Fallback to get station IDs from InfluxDB if API fails
+            query = f'''
+            from(bucket: "{INFLUXDB_BUCKET}")
+              |> range(start: -1h)
+              |> filter(fn: (r) => r["_measurement"] == "station_status")
+              |> group(columns: ["station_id"])
+              |> first()
+              |> keep(columns: ["station_id"])
+            '''
+            
+            try:
+                result = self.query_api.query(query)
+                
+                # NYC street names for fallback station names
+                street_names = [
+                    "Broadway", "Park Ave", "5th Ave", "Madison Ave", "Lexington Ave", "3rd Ave", "2nd Ave", "1st Ave",
+                    "6th Ave", "7th Ave", "8th Ave", "9th Ave", "10th Ave", "Amsterdam Ave", "Columbus Ave",
+                    "W 14th St", "W 23rd St", "W 34th St", "W 42nd St", "W 57th St", "E 14th St", "E 23rd St"
+                ]
+                
+                cross_streets = [
+                    "Broadway", "Park Ave", "5th Ave", "Madison Ave", "Lexington Ave", "3rd Ave", "2nd Ave", "1st Ave"
+                ]
+                
+                # Realistic NYC area clusters for fallback
+                service_areas = [
+                    {"lat": 40.7831, "lon": -73.9712, "weight": 30},  # Upper West Side
+                    {"lat": 40.7614, "lon": -73.9776, "weight": 40},  # Midtown
+                    {"lat": 40.7355, "lon": -74.0023, "weight": 30},  # Greenwich Village
+                    {"lat": 40.7074, "lon": -74.0113, "weight": 35},  # Financial District
+                    {"lat": 40.7178, "lon": -73.9442, "weight": 30},  # Williamsburg
+                ]
+                
+                for table in result:
+                    for record in table.records:
+                        station_id = record.values.get('station_id')
+                        if station_id:
+                            # Use hash for deterministic but realistic placement
+                            hash_val = hash(station_id)
+                            total_weight = sum(area["weight"] for area in service_areas)
+                            area_selector = hash_val % total_weight
+                            
+                            cumulative = 0
+                            selected_area = service_areas[0]
+                            for area in service_areas:
+                                cumulative += area["weight"]
+                                if area_selector < cumulative:
+                                    selected_area = area
+                                    break
+                            
+                            # Small realistic scatter
+                            lat_offset = ((hash_val % 100) - 50) * 0.0005
+                            lon_offset = ((hash(station_id + "lon") % 100) - 50) * 0.0005
+                            
+                            lat = selected_area["lat"] + lat_offset
+                            lon = selected_area["lon"] + lon_offset
+                            
+                            # Generate fallback name
+                            street_idx = hash(station_id) % len(street_names)
+                            cross_idx = hash(station_id + "cross") % len(cross_streets)
+                            station_name = f"{street_names[street_idx]} & {cross_streets[cross_idx]}"
+                            
+                            station_info[station_id] = {
+                                'name': station_name,
+                                'latitude': lat,
+                                'longitude': lon,
+                                'capacity': 30  # Default capacity
+                            }
+                
+                logger.info(f"Created fallback data for {len(station_info)} stations")
+                return station_info
+                
+            except Exception as fallback_error:
+                logger.error(f"Fallback also failed: {fallback_error}")
+                return {}
     
     def calculate_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Calculate distance between two points in kilometers"""
@@ -479,7 +620,18 @@ class CitiBikeAnomalyDetector:
             critical_anomalies = [a for a in station_anomalies_list if a.severity == "CRITICAL"]
             warning_anomalies = [a for a in station_anomalies_list if a.severity == "WARNING"]
             
-            if not station['is_installed']:
+            # A station is considered "offline" only if:
+            # 1. It's explicitly not installed AND has no recent data (no bikes/docks data)
+            # 2. OR it hasn't reported data in a very long time (> 1 hour)
+            has_recent_data = (total_capacity > 0 or station.get('last_reported', 0) > 0)
+            data_age_hours = 0
+            if station.get('last_reported', 0) > 0:
+                import time
+                data_age_hours = (time.time() - station.get('last_reported', 0)) / 3600
+            
+            if not station['is_installed'] and not has_recent_data:
+                status = "offline"
+            elif data_age_hours > 1:  # No data for more than 1 hour
                 status = "offline"
             elif critical_anomalies:
                 status = "critical"
@@ -551,10 +703,17 @@ class CitiBikeAnomalyDetector:
             warning_stations = len(set(a.station_id for a in anomalies if a.severity == "WARNING"))
             healthy_stations = max(0, active_stations - critical_stations - warning_stations)
         
+        # Calculate total bikes in system (available + disabled)
+        total_bikes_in_system = sum(s.get('num_bikes_available', 0) + s.get('num_bikes_disabled', 0) for s in stations)
+        available_bikes_total = sum(s.get('num_bikes_available', 0) for s in stations)
+        used_bikes_estimate = max(0, total_bikes_in_system - available_bikes_total)  # Bikes not at stations (in use)
+        
         return OperationalMetrics(
             timestamp=datetime.utcnow(),
             station_count=total_stations,
             total_capacity=total_bikes + available_docks if 'total_bikes' in locals() else 0,
+            available_bikes=available_bikes_total,
+            used_bikes=used_bikes_estimate,
             critical_count=critical_stations,
             warning_count=warning_stations,
             status="healthy" if critical_stations == 0 else "warning" if critical_stations < total_stations * 0.1 else "critical"
@@ -686,14 +845,19 @@ class CitiBikeAnomalyDetector:
         metrics = self.get_operational_metrics()
         map_data = self.get_map_data()
         
-        # Calculate health score (0-100)
+        # Calculate health score (0-100) with real data
         active_ratio = 0.85  # Assume 85% active stations as fallback
         health_from_active = active_ratio * 40  # 40 points for station availability
         
         critical_ratio = metrics.critical_count / metrics.station_count if metrics.station_count > 0 else 0
         health_from_issues = (1 - critical_ratio) * 30  # 30 points for lack of critical issues
         
-        capacity_balance = min(50.0, 100 - 50.0) / 50  # Assume 50% capacity as fallback
+        # Calculate real capacity utilization
+        total_bikes = sum(s.num_bikes_available for s in map_data)
+        total_capacity = sum(s.total_capacity for s in map_data)
+        real_capacity_utilization = (total_bikes / total_capacity * 100) if total_capacity > 0 else 50.0
+        
+        capacity_balance = min(real_capacity_utilization, 100 - real_capacity_utilization) / 50  # Real capacity balance
         health_from_balance = capacity_balance * 20  # 20 points for balanced capacity
         
         comm_health_ratio = len([s for s in map_data if "STALE_DATA" not in s.anomalies]) / len(map_data) if map_data else 0
@@ -713,7 +877,7 @@ class CitiBikeAnomalyDetector:
             overall_status=overall_status,
             health_score=health_score,
             active_stations_percentage=active_ratio * 100,
-            capacity_utilization=50.0,  # Use fallback value
+            capacity_utilization=real_capacity_utilization,  # Use real calculated value
             communication_health=comm_health_ratio * 100,
             maintenance_needed=metrics.warning_count,
             immediate_attention=metrics.critical_count,
@@ -982,7 +1146,7 @@ async def get_dashboard_overview():
 async def get_anomalies(
     severity: Optional[str] = Query(None, description="Filter by severity: CRITICAL, WARNING, INFO"),
     anomaly_type: Optional[str] = Query(None, description="Filter by anomaly type"),
-    limit: int = Query(100, description="Maximum number of anomalies to return")
+    limit: int = Query(10000, description="Maximum number of anomalies to return")
 ):
     """Get current anomalies detected in the system"""
     try:

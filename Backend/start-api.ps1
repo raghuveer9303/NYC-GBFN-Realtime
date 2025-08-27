@@ -30,7 +30,7 @@ Write-Host "   InfluxDB Bucket: $env:INFLUXDB_BUCKET" -ForegroundColor White
 
 # Install dependencies
 Write-Host "📦 Installing dependencies..." -ForegroundColor Blue
-pip install -r requirements.influxdb.txt
+pip install -r requirements.txt
 
 # Start the API server
 Write-Host "🌐 Starting FastAPI server on http://0.0.0.0:8000" -ForegroundColor Green
